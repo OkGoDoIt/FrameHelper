@@ -7,7 +7,7 @@ using Windows.Devices.Enumeration;
 using Windows.Storage.Streams;
 using System.Linq;
 using System.Collections;
-using System.Reflection.PortableExecutable;
+using System.Runtime.InteropServices.WindowsRuntime;
 
 namespace FrameHelper
 {
@@ -318,21 +318,69 @@ namespace FrameHelper
 		}
 
 		// a public event for dataReceived
-		public delegate void OnReceive(FrameBluetoothLEConnection sender, string receivedString);
-		public event OnReceive OnReceiveData;
+		public delegate void ReceiveString(FrameBluetoothLEConnection sender, string receivedString);
+		public event ReceiveString OnReceiveString;
+		public delegate void ReceiveBytes(FrameBluetoothLEConnection sender, byte streamId, Stream stream);
+		public event ReceiveBytes OnReceivedBytes;
 		public delegate void StatusChanged(FrameBluetoothLEConnection sender, bool isConnected, bool isPaired, bool isFound);
 		public event StatusChanged OnStatusChanged;
+
+		private Dictionary<byte, MemoryStream> DataStreams = new Dictionary<byte, MemoryStream>();
 
 		private void ReceiveCharacteristic_ValueChanged(GattCharacteristic sender, GattValueChangedEventArgs args)
 		{
 			Debug.WriteLine("Received value changed event");
-			// get the value
+			// get the value.
+			byte firstByte = args.CharacteristicValue.GetByte(0);
+			if (firstByte == 1)
+			{
+				Debug.WriteLine("Receiving data");
+				byte streamIdSigned = args.CharacteristicValue.GetByte(1);
+				byte streamId = (byte)(streamIdSigned & 0b01111111);
+				if (streamIdSigned >= 128)
+				{
+					// ending the stream
+					if (DataStreams.ContainsKey(streamId))
+					{
+						DataStreams[streamId].Seek(0, System.IO.SeekOrigin.Begin);
+						OnReceivedBytes?.Invoke(this, streamId, DataStreams[streamId]);
+						//DataStreams[streamId].Dispose();
+						DataStreams.Remove(streamId);
+						Debug.WriteLine($"Stream {streamId} ended");
+					}
+					else if (args.CharacteristicValue.Length > 2)
+					{
+						// sending data that is only one MTU long
+						// using?
+						var stream = new MemoryStream(args.CharacteristicValue.ToArray(), 2, (int)(args.CharacteristicValue.Length) - 2);
+						stream.Seek(0, System.IO.SeekOrigin.Begin);
+						OnReceivedBytes?.Invoke(this, streamId, stream);
+						Debug.WriteLine($"Stream {streamId} started and ended");
+					} else { 
+						// trying to end a stream that doesn't exist
+						Debug.WriteLine($"Stream {streamId} not found, can't end");
+					}
+				}
+				else
+				{
+					// sending stream data
+					if (!DataStreams.ContainsKey(streamId))
+					{
+						DataStreams.Add(streamId, new MemoryStream());
+					}
+					DataStreams[streamId].Write(args.CharacteristicValue.ToArray(), 2, (int)(args.CharacteristicValue.Length) - 2);
+				}
+				return;
+			}
 			using var reader = DataReader.FromBuffer(args.CharacteristicValue);
+			// peek at the first byte.  If it is not a 1, then put it back
+			
+
 			var receivedString = reader.ReadString(reader.UnconsumedBufferLength);
 			if (receivedString != null)
 			{
 				Debug.WriteLine($"Received: {receivedString}");
-				OnReceiveData?.Invoke(this, receivedString);
+				OnReceiveString?.Invoke(this, receivedString);
 			}
 		}
 

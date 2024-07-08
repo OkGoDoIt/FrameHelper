@@ -2,20 +2,19 @@
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Drawing;
 using System.Linq;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Tasks;
-using Microsoft.VisualBasic;
 using Windows.Devices.Bluetooth.GenericAttributeProfile;
-using Windows.Devices.PointOfService;
 using Windows.Storage.Streams;
-using static FrameHelper.FrameBluetoothLEConnection;
 
 namespace FrameHelper
 {
 	public class Frame
-	{
+	{ 
 		public FrameBluetoothLEConnection Connection
 		{
 			get; private set;
@@ -25,10 +24,49 @@ namespace FrameHelper
 		public Frame()
 		{
 			Connection = new FrameBluetoothLEConnection();
-			Connection.OnReceiveData += Connection_OnReceiveData;
-			//Connection.Connect();
-
+			Connection.OnReceiveString += Connection_OnReceiveData;
+			Connection.OnStatusChanged += Connection_OnStatusChanged;
+			Connection.OnReceivedBytes += Connection_OnReceivedBytes;
 		}
+
+		private void Connection_OnReceivedBytes(FrameBluetoothLEConnection sender, byte streamId, Stream stream)
+		{
+			Debug.WriteLine($"Received start of stream {streamId}");
+			if (streamId < 20)
+			{
+				string textData = null;
+				using (var reader = new StreamReader(stream))
+				{
+					textData = reader.ReadToEnd();
+				}
+			}
+			if (streamId >= 20 && streamId < 30)
+			{
+				Bitmap img = Bitmap.FromStream(stream) as Bitmap;
+				if (imageCallbacks.ContainsKey(streamId))
+				{
+					imageCallbacks[streamId](img);
+					imageCallbacks.Remove(streamId);
+				}
+			}
+		}
+
+		private void Connection_OnStatusChanged(FrameBluetoothLEConnection sender, bool isConnected, bool isPaired, bool isFound)
+		{
+			if (isConnected && Connection.MTUSize > 100 && !hasInitedHelpers)
+			{
+				Task.Run(() =>
+				{
+					lock (Connection)
+					{
+						if (!hasInitedHelpers)
+							hasInitedHelpers = this.InjectAllLibraryFunctions().Result;
+					}
+				});
+			}
+		}
+
+		private bool hasInitedHelpers = false;
 
 		private void Connection_OnReceiveData(FrameBluetoothLEConnection sender, string receivedString)
 		{
@@ -38,10 +76,10 @@ namespace FrameHelper
 				{
 					string callbackId = receivedString.Substring(1, 3);
 					string payload = receivedString.Substring(5);
-					if (callbacks.ContainsKey(callbackId))
+					if (textCallbacks.ContainsKey(callbackId))
 					{
-						callbacks[callbackId](payload);
-						callbacks.Remove(callbackId);
+						textCallbacks[callbackId](payload);
+						textCallbacks.Remove(callbackId);
 					}
 					else
 					{
@@ -51,10 +89,10 @@ namespace FrameHelper
 				else if (receivedString[4] == '.')
 				{
 					string callbackId = receivedString.Substring(1, 3);
-					if (callbacks.ContainsKey(callbackId))
+					if (textCallbacks.ContainsKey(callbackId))
 					{
-						callbacks[callbackId](callbackId);
-						callbacks.Remove(callbackId);
+						textCallbacks[callbackId](callbackId);
+						textCallbacks.Remove(callbackId);
 					}
 					else
 					{
@@ -68,23 +106,23 @@ namespace FrameHelper
 					int callbackIndex = int.Parse(receivedString[5..colonIndex]);
 					string payload = receivedString.Substring(colonIndex + 1);
 
-					if (!payloads.ContainsKey(callbackId))
+					if (!replyPayloads.ContainsKey(callbackId))
 					{
-						payloads.Add(callbackId, new List<string>());
+						replyPayloads.Add(callbackId, new List<string>());
 					}
-					if (payloads[callbackId].Count == callbackIndex)
+					if (replyPayloads[callbackId].Count == callbackIndex)
 					{
-						payloads[callbackId].Add(payload);
+						replyPayloads[callbackId].Add(payload);
 					}
-					else if (callbackIndex < payloads[callbackId].Count)
+					else if (callbackIndex < replyPayloads[callbackId].Count)
 					{
-						payloads[callbackId][callbackIndex] = payload;
+						replyPayloads[callbackId][callbackIndex] = payload;
 					}
-					else if (callbackIndex > payloads[callbackId].Count)
+					else if (callbackIndex > replyPayloads[callbackId].Count)
 					{
-						for (int i = payloads[callbackId].Count; i < callbackIndex; i++)
+						for (int i = replyPayloads[callbackId].Count; i < callbackIndex; i++)
 						{
-							payloads[callbackId].Add(null);
+							replyPayloads[callbackId].Add(null);
 						}
 					}
 				}
@@ -92,36 +130,46 @@ namespace FrameHelper
 				{
 					string callbackId = receivedString.Substring(1, 3);
 					int totalChunks = int.Parse(receivedString.Substring(5));
-					if (payloads.ContainsKey(callbackId))
+					if (!replyPayloads.ContainsKey(callbackId))
 					{
-						if (payloads[callbackId].Count == totalChunks)
+						replyPayloads.Add(callbackId, new List<string>());
+					}
+					if (replyPayloads[callbackId].Count == totalChunks)
+					{
+						string payload = string.Join("", replyPayloads[callbackId]);
+						if (textCallbacks.ContainsKey(callbackId))
 						{
-							string payload = string.Join("", payloads[callbackId]);
-							if (callbacks.ContainsKey(callbackId))
-							{
-								callbacks[callbackId](payload);
-								callbacks.Remove(callbackId);
-							}
-							else
-							{
-								Debug.WriteLine($"Callback for {callbackId} not found");
-							}
-							payloads.Remove(callbackId);
+							textCallbacks[callbackId](payload);
+							textCallbacks.Remove(callbackId);
 						}
 						else
 						{
-							Debug.WriteLine($"Expected {totalChunks} chunks, but got {payloads[callbackId].Count}");
+							Debug.WriteLine($"Callback for {callbackId} not found");
 						}
+						replyPayloads.Remove(callbackId);
 					}
 					else
 					{
-						Debug.WriteLine($"Extended callback {callbackId} not found");
+						Debug.WriteLine($"Expected {totalChunks} chunks, but got {replyPayloads[callbackId].Count}");
 					}
+
 				}
 			}
 			else if (_onReceive != null)
 			{
 				_onReceive(receivedString);
+			}
+
+			if (Connection.IsConnected && Connection.MTUSize > 100 && !hasInitedHelpers)
+			{
+				Task.Run(() =>
+				{
+					lock (Connection)
+					{
+						if (!hasInitedHelpers)
+							hasInitedHelpers = this.InjectAllLibraryFunctions().Result;
+					}
+				});
 			}
 		}
 
@@ -132,13 +180,14 @@ namespace FrameHelper
 				throw new ArgumentNullException("connection");
 			}
 			this.Connection = connection;
+			this.Connection.OnReceiveString += Connection_OnReceiveData;
 		}
 
 		float? cachedBatteryLevel = null;
 		DateTimeOffset whenBatteryLevelCached = DateTimeOffset.MinValue;
 		public async Task<float?> GetBatteryLevelAsync()
 		{
-			if (cachedBatteryLevel != null && DateTimeOffset.Now - whenBatteryLevelCached < TimeSpan.FromSeconds(30))
+			if (DateTimeOffset.Now - whenBatteryLevelCached < TimeSpan.FromSeconds(30))
 			{
 				return cachedBatteryLevel;
 			}
@@ -146,14 +195,12 @@ namespace FrameHelper
 			string result = null;
 
 			if (Connection.MTUSize > 100)
-				result = await PrintShortLuaResponse("frame.battery_level()", TimeSpan.FromSeconds(1));
+				result = await PrintShortLuaResponse("frame.battery_level()", TimeSpan.FromSeconds(5));
 			else
 			{
-				if (await SendLua("fr=frame"))
-					if (await SendLua("bl=fr.battery_level"))
-					{
-						result = await PrintShortLuaResponse("bl()", TimeSpan.FromSeconds(1));
-					}
+				cachedBatteryLevel = null;
+				whenBatteryLevelCached = DateTimeOffset.Now;
+				return null;
 			}
 			if (result != null && float.TryParse(result, out float batteryLevel))
 			{
@@ -162,6 +209,7 @@ namespace FrameHelper
 				return batteryLevel;
 			}
 			cachedBatteryLevel = null;
+			whenBatteryLevelCached = DateTimeOffset.Now;
 			return null;
 		}
 
@@ -238,67 +286,24 @@ namespace FrameHelper
 			await SendLua($"frame.display.text(\"{text}\")");
 		}
 
-		private readonly ReadOnlyDictionary<char, string> luaEscapeSequences = new ReadOnlyDictionary<char, string>(new Dictionary<char, string>
-		{
-			{ '\\', @"\\" },
-			{ '\n', @"\n" },
-			{ '\r', @"\r" },
-			{ '\t', @"\t" },
-			{ '\"', "\\\"" },
-			{ '[', @"\[" },
-			{ ']', @"\]" }
-		});
+
 
 		public async Task SaveFile(string filename, string contents)
 		{
-			contents = contents.Replace(Environment.NewLine, "\n");
-			foreach (var kvp in luaEscapeSequences)
-			{
-				contents = contents.Replace(kvp.Key.ToString(), kvp.Value);
-			}
-			string varName = "f" + filename.Split('.').First();
-			await SendLuaAutoRetry($"{varName} = frame.file.open(\"{filename}\", \"write\")");
-			int curIndex = 0;
-			int chunkIndex = 1;
-			while (curIndex < contents.Length)
-			{
-				int nextChunkLength = Math.Min(contents.Length - curIndex, (this.Connection.MTUSize ?? 23) - 30 - varName.Length);
-				if (nextChunkLength <= 0)
-				{
-					break;
-				}
-				while (contents[curIndex + nextChunkLength - 1] == '\\' && nextChunkLength > 0)
-				{
-					nextChunkLength--;
-				}
-				if (nextChunkLength <= 0)
-				{
-					break;
-				}
-				string partToSend = contents.Substring(curIndex, nextChunkLength);
-
-				await SendLuaAutoRetry($"{varName}:write(\"{partToSend}\")");
-				curIndex += nextChunkLength;
-				Debug.WriteLine($"chunk {chunkIndex++} written");
-			}
-			await SendLuaAutoRetry($"{varName}:close()");
-			Debug.WriteLine("file written, total of " + chunkIndex + " chunks");
-			/*await Connection.SendLua($"fr = frame.file.open(\"{filename}\", \"r\")");
-			string readContents = await Connection.PrintLuaResponse("fr:read \"*a\"");
-			await Connection.SendLua("fr:close()");
-			Debug.WriteLine("expected: " + contents);
-			Debug.WriteLine("  actual: " + readContents);
-			Debug.Assert(contents == readContents);
-			*/
+			await FrameFile.WriteFile(this, filename, contents);
 		}
 
 		private string getUnusedScriptName()
 		{
-			// the id should be 2 chars long
+			// the id should be 4 chars long
 			string id = null;
 			do
 			{
-				id = Convert.ToChar((int)'a' + Random.Shared.Next(26)).ToString() + Convert.ToChar((int)'a' + Random.Shared.Next(26)).ToString();
+				id = "";
+				for (int i = 0; i < 4; i++)
+				{
+					id += Convert.ToChar((int)'a' + Random.Shared.Next(26)).ToString();
+				}
 			} while (scriptNames.Contains(id));
 			return id;
 		}
@@ -312,46 +317,9 @@ namespace FrameHelper
 			await SendLuaChecked($"require(\"{name}\")");
 		}
 
-		public async Task<bool> RunScriptViaString(string script, string overrideName = null)
-		{
-			string varName = (overrideName ?? "s"+getUnusedScriptName());
-
-			string contents = script.Replace(Environment.NewLine, "\n");
-			foreach (var kvp in luaEscapeSequences)
-			{
-				script = script.Replace(kvp.Key.ToString(), kvp.Value);
-			}
-			await SendLuaChecked($"{varName} = ''");
-			int curIndex = 0;
-			int chunkIndex = 1;
-			while (curIndex < contents.Length)
-			{
-				int nextChunkLength = Math.Min(contents.Length - curIndex, (this.Connection.MTUSize ?? 23) - 30 - varName.Length);
-				if (nextChunkLength <= 0)
-				{
-					break;
-				}
-				while (contents[curIndex + nextChunkLength - 1] == '\\' && nextChunkLength > 0)
-				{
-					nextChunkLength--;
-				}
-				if (nextChunkLength <= 0)
-				{
-					break;
-				}
-				string partToSend = contents.Substring(curIndex, nextChunkLength);
-
-				await SendLuaChecked($"{varName} = {varName} . \"{partToSend}\"");
-				curIndex += nextChunkLength;
-				Debug.WriteLine($"chunk {chunkIndex++} sent");
-			}
-			
-			return await SendLuaChecked($"loadstring({varName})()");
-		}
-
 		public int GetByteLengthOfString(string str)
 		{
-			var writer = new DataWriter();
+			var writer = new Windows.Storage.Streams.DataWriter();
 			writer.WriteString(str);
 			return (int)writer.UnstoredBufferLength;
 		}
@@ -421,7 +389,8 @@ namespace FrameHelper
 				}
 				else
 				{
-					Debug.WriteLine("String too long to send in one go");
+					Debug.WriteLine($"String too long to send in one go ({GetByteLengthOfString(luaCodeToSend)} / {Connection.MTUSize})");
+					Debug.WriteLine(luaCodeToSend);
 					return false;
 					throw new ArgumentOutOfRangeException("The string is too long to send in one go");
 				}
@@ -517,7 +486,7 @@ namespace FrameHelper
 			return result;
 		}
 
-		public async Task<string> PrintShortLuaResponse(string luaExpression, TimeSpan? maxTimespanToWaitForReply = null)
+		public async Task<string> PrintShortLuaResponse(string luaExpression, TimeSpan? maxTimespanToWaitForReply = null, string runBeforePrinting = null)
 		{
 			string result = null;
 			// wait for the reply
@@ -525,7 +494,10 @@ namespace FrameHelper
 			{
 				result = receivedString;
 			});
-			await SendLua($"print(\"~{callbackId}:\"..{luaExpression})");
+			if (runBeforePrinting != null)
+				await SendLua(runBeforePrinting + $";print(\"~{callbackId}:\"..{luaExpression})");
+			else
+				await SendLua($"print(\"~{callbackId}:\"..{luaExpression})");
 			// wait for result to have a value, or for maxTimespanToWaitForReply to elapse
 			var waitForReplyTask = Task.Run(() =>
 			{
@@ -546,19 +518,18 @@ namespace FrameHelper
 			return result;
 		}
 
-		public async Task<string> PrintLuaResponse(string luaExpression, TimeSpan? maxTimespanToWaitForReply = null)
+		public async Task<string> PrintLuaResponse(string luaExpression, TimeSpan? maxTimespanToWaitForReply = null, string runBeforePrinting = null)
 		{
-			if (!printLongInjected)
-			{
-				await initLongPrint();
-			}
 			string result = null;
 			// wait for the reply
 			string callbackId = registerCallback((receivedString) =>
 			{
 				result = receivedString;
 			});
-			await SendLua($"prntLng(\"{callbackId}\",{luaExpression})");
+			if (runBeforePrinting != null)
+				await SendLua(runBeforePrinting + $";prntLng(\"{callbackId}\",{luaExpression})");
+			else
+				await SendLua($"prntLng(\"{callbackId}\",{luaExpression})");
 			// wait for result to have a value, or for maxTimespanToWaitForReply to elapse
 			var waitForReplyTask = Task.Run(() =>
 			{
@@ -578,28 +549,11 @@ namespace FrameHelper
 			}
 			return result;
 		}
-
-
-		private bool printLongInjected = false;
-		private async Task initLongPrint()
-		{
-			string exisits = await PrintShortLuaResponse("tostring(prntLng ~= nil)");
-			if (exisits != "true")
-			{
-				printLongInjected = false;
-				Debug.Print("prntLng does not exist, creating it");
-				await RunScriptViaFile(returnHelperScript, "prlng");
-				Debug.Print("prntLng created");
-				printLongInjected = true;
-			}
-			printLongInjected = true;
-		}
-
 
 		private string registerCallback(Action<string> callback)
 		{
 			string callbackId = getUnusedCallbackId();
-			callbacks.Add(callbackId, callback);
+			textCallbacks.Add(callbackId, callback);
 			return callbackId;
 		}
 		private string getUnusedCallbackId()
@@ -609,40 +563,103 @@ namespace FrameHelper
 			do
 			{
 				id = Guid.NewGuid().ToString().Substring(0, 3);
-			} while (callbacks.ContainsKey(id));
+			} while (textCallbacks.ContainsKey(id));
 			return id;
 		}
-		private Dictionary<string, Action<string>> callbacks = new Dictionary<string, Action<string>>();
-		private Dictionary<string, List<string>> payloads = new Dictionary<string, List<string>>();
-		private Action<string> _onReceive;
 
-		private const string returnHelperScript = """
-			local mtu = frame.bluetooth.max_length()
-			frame.print('mtu: '..mtu)
-			function prntLng(id,stringToPrint)
-				local len = string.len(stringToPrint)
-				local i = 1
-				local chunkIndex = 0
-				while i <= len do
-					local chunk = string.sub(stringToPrint, i, i+mtu-11)
-					frame.print('~'..id..'-'..chunkIndex..':'..chunk)
-					chunkIndex = chunkIndex + 1
-					i = i + mtu
-				end
-				frame.print('cb~'..id..'!'..chunkIndex)
-			end
-			frame.print('prntLng injected')
-			frame.display.text('Hello world', 50, 100)
-			frame.display.show()
-			""";
+		private Dictionary<byte, Action<Vector3>> motionCallbacks = new Dictionary<byte, Action<Vector3>>();
+		private Dictionary<byte, Action<Memory<double>>> audioCallbacks = new Dictionary<byte, Action<Memory<double>>>();
+		private Dictionary<byte, Action<Bitmap>> imageCallbacks = new Dictionary<byte, Action<Bitmap>>();
+		private Dictionary<string, Action<string>> textCallbacks = new Dictionary<string, Action<string>>();
+		private Dictionary<string, List<string>> replyPayloads = new Dictionary<string, List<string>>();
+		private Action<string> _onReceive;
 
 		public async Task<bool> Stop()
 		{
-			return await SendRaw(3);
+			Debug.WriteLine("Stopping");
+			bool succeeded = await SendRaw(3);
+			Debug.WriteLine("Stop " + (succeeded ? "succeeded" : "failed"));
+			return succeeded;
 		}
 		public async Task<bool> Reset()
 		{
-			return await Helpers.AutoRetry(() => SendRaw(4), 3);
+			Debug.WriteLine("Resetting");
+			bool succeeded = await SendRaw(4);
+			Debug.WriteLine("Reset " + (succeeded ? "succeeded" : "failed"));
+
+			if (succeeded)
+			{
+				this.hasInitedHelpers = false;
+			}
+
+			return succeeded;
+		}
+
+		public FrameDirectory GetFilesystemRoot()
+		{
+			return new FrameDirectory(this, "/");
+		}
+
+		public async Task<Bitmap> GetCameraPhoto(int quality = 50, bool autoExposure = true)
+		{
+			switch (quality)
+			{
+				case 1:
+					quality = 10;
+					break;
+				case 2:
+					quality = 25;
+					break;
+				case 3:
+					quality = 50;
+					break;
+				case 4:
+					quality = 100;
+					break;
+				case 10:
+					break;
+				case 25:
+					break;
+				case 50:
+					break;
+				case 100:
+					break;
+				default:
+					throw new ArgumentOutOfRangeException("quality", "Quality must be 10, 25, 50, or 100");
+			}
+			await SendLuaChecked("mtu = frame.bluetooth.max_length();frame.camera.wake()");
+
+			if (autoExposure)
+			{
+				await SendLuaChecked("for _=1, 20 do;frame.camera.auto{};frame.sleep(0.1);end");
+			}
+
+			byte thisCalbackIndex = 255;
+
+			for (int i = 20; i < 30; i++)
+			{
+				if (!imageCallbacks.ContainsKey((byte)i))
+				{
+					thisCalbackIndex = (byte)i;
+					break;
+				}
+			}
+
+			if (thisCalbackIndex == 255)
+			{
+				throw new InvalidOperationException("No available callback index");
+			}
+
+			TaskCompletionSource<Bitmap> tcs = new TaskCompletionSource<Bitmap>();
+			imageCallbacks.Add(thisCalbackIndex, (img) =>
+			{
+				tcs.SetResult(img);
+			});
+
+			await SendLuaChecked("frame.camera.capture{quality_factor=" + quality.ToString() + "};");
+			await SendLua($"while true do;local i=frame.camera.read(frame.bluetooth.max_length()-1) if (i==nil) then break end while true do if pcall(frame.bluetooth.send,'\\x01'..string.char({thisCalbackIndex})..i) then break end end end;bluetooth.send('\\x01'..string.char({thisCalbackIndex+128}))");
+
+			return await tcs.Task;
 		}
 	}
 }
